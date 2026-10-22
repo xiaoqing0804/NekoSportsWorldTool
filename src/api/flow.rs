@@ -107,6 +107,35 @@ pub fn run_full_flow_cancellable(
     log: &mut dyn FnMut(&str),
     control: &crate::task_control::Control,
 ) -> Result<RunOutcome, String> {
+    run_flow_inner(client, params, log, control, None)
+}
+
+pub fn run_planned_flow(
+    client: &mut ApiClient,
+    plan: &super::planned::Plan,
+    log: &mut dyn FnMut(&str),
+) -> Result<RunOutcome, String> {
+    plan.validate_at(crate::crypto::envelope::now_ms())?;
+    let anchor = client.identity.anchor_coordinate()?;
+    if plan.distance_from_anchor(anchor.latitude, anchor.longitude) > 1.0 {
+        return Err("设备锚点与预约锚点不一致，未提交".into());
+    }
+    run_flow_inner(
+        client,
+        &plan.params(),
+        log,
+        &crate::task_control::Control::default(),
+        Some(plan),
+    )
+}
+
+fn run_flow_inner(
+    client: &mut ApiClient,
+    params: &RunParams,
+    log: &mut dyn FnMut(&str),
+    control: &crate::task_control::Control,
+    plan: Option<&super::planned::Plan>,
+) -> Result<RunOutcome, String> {
     control.check()?;
     if !params.dist.is_finite() || params.dist <= 0.0 || params.dur <= 0 {
         return Err("距离和时长必须为正数".into());
@@ -117,7 +146,16 @@ pub fn run_full_flow_cancellable(
 
     // ① policy
     log("[policy] 拉取跑步策略…");
-    let pol = fetch_policy(client)?;
+    let pol = if plan.is_some() {
+        let response = super::policy::fetch_response(client)?;
+        save_plan_evidence(
+            "planned-policy.json",
+            &crate::textlog::redact_json(&response),
+        )?;
+        super::policy::parse_response(&response)?
+    } else {
+        fetch_policy(client)?
+    };
     log(&format!(
         "√ [policy] ts={} policy={} minDistance={} validTime={}",
         pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
@@ -166,6 +204,15 @@ pub fn run_full_flow_cancellable(
         return Err("实时点位包含无效坐标".into());
     }
     let route_pts = points::route_points(&pol.must_points, &pts);
+    if plan.is_some() {
+        save_plan_evidence("planned-points.json", &serde_json::json!(pts))?;
+        save_plan_evidence(
+            "planned-fences.json",
+            &serde_json::json!({
+                "runAreaId": fences.area.run_area_id, "geoFences": fences.area.geo_fences,
+            }),
+        )?;
+    }
     log(&format!(
         "[points] 去重后 {} 个路线点位（包含全部策略必经点）",
         route_pts.len()
@@ -181,48 +228,57 @@ pub fn run_full_flow_cancellable(
         route_pts.len()
     ));
     // 随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s），轨迹/提交/OBS/五点统一使用
-    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
-    let mut track = match params.route_mode {
-        RouteMode::Road => {
-            if !fences.polygons.is_empty() {
-                super::school_roads::validate_fences(&fences.polygons)?;
+    let start_ms = params.start_ms
+        + if plan.is_some() {
+            0
+        } else {
+            (rand::random::<u32>() % 5) as i64 * 1000
+        };
+    let mut track = if let Some(plan) = plan {
+        plan.build_track(&pol, &pts, &fences.polygons)?
+    } else {
+        match params.route_mode {
+            RouteMode::Road => {
+                if !fences.polygons.is_empty() {
+                    super::school_roads::validate_fences(&fences.polygons)?;
+                }
+                let config = super::model::load_config();
+                let mut net = super::school_roads::load_for_route_cancellable(
+                    &config.osm_path,
+                    &sess.unid,
+                    &fences.polygons,
+                    &route_pts,
+                    false,
+                    control,
+                    log,
+                )?;
+                crate::track::generate_road::align_network(&mut net);
+                let filtered = crate::track::generate_road::apply_fences(&net, &fences.polygons);
+                log(if fences.polygons.is_empty() {
+                    "[road] 学校边界未提供；沿点位闭环重复补足距离，无法保证校内范围"
+                } else {
+                    "[road] 在学校围栏内沿点位闭环重复补足距离"
+                });
+                crate::track::generate_road::build_road(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &route_pts,
+                    &route_pts,
+                    &filtered,
+                )
+                .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
             }
-            let config = super::model::load_config();
-            let mut net = super::school_roads::load_for_route_cancellable(
-                &config.osm_path,
-                &sess.unid,
-                &fences.polygons,
-                &route_pts,
-                false,
-                control,
-                log,
-            )?;
-            crate::track::generate_road::align_network(&mut net);
-            let filtered = crate::track::generate_road::apply_fences(&net, &fences.polygons);
-            log(if fences.polygons.is_empty() {
-                "[road] 学校边界未提供；沿点位闭环重复补足距离，无法保证校内范围"
-            } else {
-                "[road] 在学校围栏内沿点位闭环重复补足距离"
-            });
-            crate::track::generate_road::build_road(
+            RouteMode::Legacy => gen_track(
                 params.dist,
                 params.dur,
                 params.seed,
+                (anchor.latitude, anchor.longitude),
                 start_ms,
                 &route_pts,
-                &route_pts,
-                &filtered,
-            )
-            .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
+            ),
         }
-        RouteMode::Legacy => gen_track(
-            params.dist,
-            params.dur,
-            params.seed,
-            (anchor.latitude, anchor.longitude),
-            start_ms,
-            &route_pts,
-        ),
     };
     control.check()?;
     if let Some(range) = params.manual_altitude_range {
@@ -257,6 +313,17 @@ pub fn run_full_flow_cancellable(
         }
     }
     let five = five_point_wrapper(&pts, &track, &fences.area);
+
+    if let Some(plan) = plan {
+        plan.validate_at(crate::crypto::envelope::now_ms())?;
+        plan.validate_track(&track, &pol, &pts, &fences.polygons)?;
+        save_plan_evidence("planned-track.json", &serde_json::json!(track))?;
+        if fences.polygons.is_empty() {
+            log(
+                "[plan] 未返回校园围栏；路线按本校服务器点位生成并限制在锚点区域，校园边界尚未验证",
+            );
+        }
+    }
 
     // ⑤ 提交（sportType=1）
     control.begin_submit()?;
@@ -320,6 +387,27 @@ pub fn run_full_flow_cancellable(
     })
 }
 
+fn save_plan_evidence(name: &str, value: &Value) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(crate::platform::data_dir().join(name))
+        .map_err(|e| e.to_string())?;
+    file.write_all(
+        serde_json::to_string_pretty(value)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
 /// AI 提交流（UI 线程用）。
 pub fn run_ai_submit(
     client: &mut ApiClient,
@@ -353,13 +441,22 @@ pub fn run_records(
     let rows = super::records::fetch_records(client)?;
     if let Some(session) = &client.login {
         let reconciliation = (|| {
-            let mut guard = super::submission_guard::Guard::open(session.uid, session.unid.parse().map_err(|_| "学校编号无效")?)?;
+            let mut guard = super::submission_guard::Guard::open(
+                session.uid,
+                session.unid.parse().map_err(|_| "学校编号无效")?,
+            )?;
             let found = guard.reconcile(&rows)?;
-            for id in found { log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交")); }
-            if guard.has_pending() { log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效"); }
+            for id in found {
+                log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交"));
+            }
+            if guard.has_pending() {
+                log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效");
+            }
             Ok::<_, String>(())
         })();
-        if let Err(error) = reconciliation { log(&format!("[record] 提交保护核对未完成：{error}")); }
+        if let Err(error) = reconciliation {
+            log(&format!("[record] 提交保护核对未完成：{error}"));
+        }
     }
     log(&format!("√ [records] {} 条记录", rows.len()));
     Ok(rows)

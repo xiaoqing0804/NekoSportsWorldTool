@@ -53,6 +53,11 @@ fn extract_must_points(v: &serde_json::Value) -> Result<Vec<(f64, f64)>, String>
 
 /// body：{"runMode":1,"ruleUpdateTime":0,"geoFenceUpdateTime":0,"selectUnid":<unid>,"operateType":0}
 pub fn fetch_policy(client: &mut ApiClient) -> Result<PolicyInfo, String> {
+    parse_response(&fetch_response(client)?)
+}
+
+/// 保留规则响应供只读诊断；与跑步流程使用完全相同的请求参数。
+pub fn fetch_response(client: &mut ApiClient) -> Result<Value, String> {
     let unid = client
         .login
         .as_ref()
@@ -67,8 +72,7 @@ pub fn fetch_policy(client: &mut ApiClient) -> Result<PolicyInfo, String> {
         "operateType": 0,
     })
     .to_string();
-    let biz = client.call("POST", POLICY_PATH, &body, &[])?;
-    parse_response(&biz)
+    client.call("POST", POLICY_PATH, &body, &[])
 }
 
 pub(crate) fn parse_response(biz: &Value) -> Result<PolicyInfo, String> {

@@ -21,6 +21,13 @@ fn usage() {
   login   --user <手机号> --pass <密码> [--remember]
                                            登录并保存会话；--remember 同时保存凭据供自动重登
   logout                                   登出并清理本地会话
+  policy                                   只读查询跑步策略，输出请求时间与规则响应
+  fences                                   只读查询学校跑步围栏与区域编号
+  points                                   只读获取当前锚点的服务器打卡点
+  run-planned --file <JSON> --check          离线校验一次跑步计划
+  run-planned --file <JSON> --preview-points <JSON>
+                                           使用已保存点位离线预览；不查询策略或提交
+  run-planned --file <JSON> --execute        仅在预约窗口内执行一次计划流程
   run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）

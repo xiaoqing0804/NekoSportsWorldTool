@@ -12,6 +12,7 @@ pub mod login;
 pub mod model;
 pub mod obs;
 pub mod points;
+pub mod planned;
 pub mod policy;
 pub mod rank;
 pub mod records;

@@ -11,6 +11,10 @@ pub fn dispatch(args: Vec<String>) -> i32 {
     match cmd {
         "login" => cmd_login(&rest),
         "logout" => cmd_logout(),
+        "policy" => cmd_policy(),
+        "fences" => cmd_fences(),
+        "points" => cmd_points(),
+        "run-planned" => cmd_run_planned(&rest),
         "run" => cmd_run(&rest),
         "template" => cmd_template(&rest),
         "ai" => cmd_ai(&rest),
@@ -78,6 +82,145 @@ fn cmd_logout() -> i32 {
     let mut log = logger();
     crate::api::login::logout(&mut client, &mut log);
     0
+}
+
+fn cmd_policy() -> i32 {
+    let mut client = match make_client() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    let china_time =
+        chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+    println!(
+        "[policy] 请求时间={} POST {}",
+        china_time.to_rfc3339(),
+        crate::api::policy::POLICY_PATH
+    );
+    match crate::api::policy::fetch_response(&mut client) {
+        Ok(response) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::textlog::redact_json(&response)).unwrap()
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("[policy] 读取跑步策略失败: {error}");
+            1
+        }
+    }
+}
+
+fn cmd_fences() -> i32 {
+    let mut client = match make_client() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    match crate::api::fence::fetch_geo_fence_response(&mut client) {
+        Ok(response) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "runAreaId": response.area.run_area_id,
+                    "geoFences": response.area.geo_fences,
+                }))
+                .unwrap()
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("[fences] 读取学校围栏失败: {error}");
+            1
+        }
+    }
+}
+
+fn cmd_points() -> i32 {
+    let result = (|| {
+        let mut client = make_client()?;
+        let anchor = client.identity.anchor_coordinate()?;
+        let fences = crate::api::fence::fetch_geo_fence_response(&mut client)?;
+        let area = (fences.area.run_area_id >= 0).then(|| fences.area.run_area_id.to_string());
+        let points =
+            crate::api::points::fetch_points_ext(&mut client, anchor, area, &mut super::silent())?;
+        Ok::<_, String>(points)
+    })();
+    match result {
+        Ok(points) => {
+            println!("{}", serde_json::to_string_pretty(&points).unwrap());
+            0
+        }
+        Err(error) => {
+            eprintln!("[points] {error}");
+            1
+        }
+    }
+}
+
+fn cmd_run_planned(rest: &[&str]) -> i32 {
+    let flags = parse_flags(rest);
+    let result = (|| {
+        let file = get(&flags, "file").ok_or("缺少 --file <计划 JSON>")?;
+        let plan: crate::api::planned::Plan =
+            serde_json::from_slice(&std::fs::read(file).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("计划格式无效：{e}"))?;
+        plan.validate()?;
+        let check = get(&flags, "check").is_some();
+        let preview = get(&flags, "preview-points");
+        let execute = get(&flags, "execute").is_some();
+        if check as u8 + preview.is_some() as u8 + execute as u8 != 1 {
+            return Err("必须且只能选择 --check、--preview-points <JSON> 或 --execute".into());
+        }
+        if check {
+            return Ok(serde_json::json!({"status":"plan_valid", "network_requests":false}));
+        }
+        if let Some(path) = preview {
+            let points: Vec<serde_json::Value> =
+                serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("点位 JSON 无效：{e}"))?;
+            let policy = crate::api::policy::PolicyInfo {
+                timestamp: 0,
+                policy: 0,
+                min_distance: 1000,
+                valid_time: 0,
+                must_points: vec![],
+            };
+            let track = plan.build_track(&policy, &points, &[])?;
+            return Ok(
+                serde_json::json!({"status":"offline_preview_only", "policy_checked":false,
+                "fence_checked":false, "record_submitted":false, "track":track,
+                "fivePointJson":crate::track::wire::five_point_payload(&points, &track)}),
+            );
+        }
+        // 先检查执行时段，再构造客户端；错误时不会触发自动登录。
+        plan.validate_at(now_ms())?;
+        let mut client = make_client()?;
+        let mut log = |line: &str| eprintln!("{}", crate::textlog::clean(line));
+        let out = crate::api::flow::run_planned_flow(&mut client, &plan, &mut log)?;
+        Ok::<_, String>(
+            serde_json::json!({"status":"record_accepted", "record_submitted":true,
+            "record_id":out.result.rrid, "distance_m":out.result.total_dis,
+            "duration_s":out.result.total_time, "steps":out.result.total_steps,
+            "cadence_spm":out.result.avg_step_freq, "obs_uploaded":out.obs_ok,
+            "verification":out.verification}),
+        )
+    })();
+    match result {
+        Ok(output) => {
+            println!("{}", output);
+            0
+        }
+        Err(error) => {
+            eprintln!("[plan] {error}");
+            1
+        }
+    }
 }
 
 fn cmd_run(rest: &[&str]) -> i32 {
@@ -645,10 +788,15 @@ fn cmd_cheat(rest: &[&str]) -> i32 {
     match crate::api::cheat::query(&mut client, page, &mut log) {
         Ok(r) => {
             println!("自查：{}", r.label());
-            println!("检查时间：{}", crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间"));
+            println!(
+                "检查时间：{}",
+                crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间")
+            );
             if r.status() == crate::api::cheat::Status::Flagged {
                 println!("服务端原因：{}；发生时间：{}", r.reason(), r.occurred_at());
-                if let Some(id) = r.record_id() { println!("关联跑步记录：{id}"); }
+                if let Some(id) = r.record_id() {
+                    println!("关联跑步记录：{id}");
+                }
             }
             println!("本页通报 {} 条（非全校总数）", r.list.len());
             for item in r.list.iter().take(20) {

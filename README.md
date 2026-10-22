@@ -36,6 +36,9 @@
 
 ```text
 NekoSportsWorldTool login --user <手机号> --pass <密码> --remember
+NekoSportsWorldTool policy                               # 只读查询跑步策略与当前规则
+NekoSportsWorldTool fences                               # 只读查询学校围栏和区域编号
+NekoSportsWorldTool points                               # 只读查询当前定位锚点的打卡点
 NekoSportsWorldTool run                                  # 一键跑步（--altitude 17.2 固定海拔，或 11.6-22.8 映射到区间）
 NekoSportsWorldTool ai --sport 2 --score 26000           # AI 运动
 NekoSportsWorldTool rank main --type 1 --sort 1          # 排行榜
@@ -47,6 +50,25 @@ NekoSportsWorldTool help                                 # 全部命令
 `template` 只读取用户手动选择的本地 GPX/JSON 文件，输出采样点、海拔范围、累计上升和累计下降，
 不会登录、访问服务器或把模板记录接入跑步上传流程。
 
+`policy` 使用已有会话读取学校跑步策略，输出北京时间、接口路径及规则响应；未登录时沿用已保存凭据的自动登录逻辑。它不生成或提交跑步记录，适合排查时间限制。Linux 调试构建可运行 `./target/debug/nekosportsworldtool policy`。
+
+`fences` 查询学校服务端围栏；返回空列表时不能据此确认校园边界，也不能把一个定位锚点当作全程在校内的保证。
+
+`scripts/policy_probe.py` 用于一次性定时任务：使用私有目录中的固定程序副本与会话，按 `schedule.json` 的北京时间执行，只允许在预约后的五分钟内启动请求。默认只读策略和围栏；会话失效时可使用 `login-once.json` 重登一次，完成后删除该凭据文件。用 `--state-dir <私有任务目录> --preflight` 检查文件而不联网。任务目录应放在仓库外，权限为 `0700`，凭据及运行数据权限为 `0600`。
+
+显式配置 `submission_plan_sha256`（`run-plan.json` 的 SHA-256）及 `max_submissions: 1` 后，策略和围栏读取成功才会调用一次 `run-planned --file <计划文件> --execute`。计划与程序都校验哈希；任务启动标记持久化后不会再次执行。结果写入 `result.json`，保留策略、点位、轨迹、提交日志和回执。`record_submitted: null` 表示结果未知，禁止盲目重试；`record_submitted: true` 与服务端 `verification.complete` 达标判定分别记录。
+
+在 `schedule.json` 中设置 `results_dir` 为工作区文件夹的绝对路径，可在任务结束时自动复制结果、日志、轨迹和回执；登录凭据、设备身份与会话文件不会复制。`--state-dir <私有任务目录> --export-results` 可离线同步已有结果。
+
+`run-planned` 的计划字段见 `src/api/planned.rs::Plan`：时间均为真实北京时间对应的毫秒时间戳，包含预约、跑步开始及学校开放时段；距离 1000–2000 米、时长 300–1200 秒，配速仍须在 3–10 分钟/公里内。例如 2 公里、7:16/公里对应 `duration_s: 872`。`height_cm` 仅作步长检查，不写入海拔或账户资料。配置 BD-09 锚点、区域半径、步频与随机种子。运行前会验证最终轨迹、策略必经点、固定打卡点及服务端提供的围栏；可选打卡点按实际经过情况上报。空围栏不能证明路线全程在校内。
+
+```bash
+./target/debug/nekosportsworldtool run-planned --file /private/run-plan.json --check
+./target/debug/nekosportsworldtool run-planned --file /private/run-plan.json --preview-points /private/points.json
+```
+
+以上两种检查均不联网、不提交；离线预览不代表服务器已确认规则。`--execute` 才运行真实流程，且仅在预约后的五分钟内允许提交。定时进程应配置 `TZ=Asia/Shanghai` 和 `UMask=0077`。
+
 手动海拔支持三种状态：留空使用自动海拔；填写单个数字（例如 `17.2`）让所有轨迹点使用固定海拔；填写区间（例如 `11.6-22.8`）将生成的海拔曲线映射到该上下限内，同时保留轨迹的相对起伏。
 
 青龙定时任务：首次手工 `login --remember` 一次，之后定时挂 `run` 即可。
@@ -56,6 +78,7 @@ NekoSportsWorldTool help                                 # 全部命令
 - **提示未登录 / 401**：先执行 `login --remember`（GUI 勾选记住密码等价），会话失效会自动重登
 - **10121 设备风险**：设备身份是持久化的，删除 `identity.json` 等于换了新设备，不要频繁删
 - **10603 点位限流**：点位接口 5 分钟限 3 次，程序内置 300s 缓存，正常使用不会触发
+- **11016 不在有效跑步时间内**：运行 `policy` 查看错误是否来自 `/api/v70103/runModePolicy`。该请求不携带界面选择的跑步开始时间；若此处被拒绝，应核对学校当前开放时段，调整记录开始时间不会改变策略请求。
 - **榜单为空**：当天还没有人产生有效里程，查询会自动回退最近 3 天
 - **检查更新失败**：更新仅直连 GitHub，网络不通时到 [Release](https://github.com/YanamiNeko/NekoSportsWorldTool/releases) 手动下载
 - **手动更新方式**：Windows 下载新的 `nekosportsworldtool.exe` 后退出软件，用新文件替换旧文件；请保留 `config.json`、`identity.json`、`points_cache.json` 等配置文件，不要删除或修改。
@@ -67,6 +90,7 @@ NekoSportsWorldTool help                                 # 全部命令
 ```bash
 cargo build --release                        # GUI + CLI
 cargo build --release --no-default-features  # 仅 CLI
+python3 -m unittest discover -s scripts -p 'test_policy_probe.py'  # 定时诊断的离线回归
 ```
 
 推 tag 自动构建 Windows / macOS / Linux 四平台产物并发布 Release（见 `.github/workflows/release.yml`）。
