@@ -48,14 +48,34 @@ fn usage() {
 
 fn cmd_login(rest: &[&str]) -> i32 {
     let flags = parse_flags(rest);
-    let (Some(user), Some(pw)) = (get(&flags, "user"), get(&flags, "pass")) else {
-        eprintln!("缺少 --user / --pass");
+    let from_env = get(&flags, "env").is_some();
+    let credentials = if from_env {
+        if get(&flags, "user").is_some() || get(&flags, "pass").is_some() {
+            eprintln!("--env 不能与 --user / --pass 同时使用");
+            return 1;
+        }
+        (
+            std::env::var("NEKOSPORTS_USERNAME").ok(),
+            std::env::var("NEKOSPORTS_PASSWORD").ok(),
+        )
+    } else {
+        (
+            get(&flags, "user").map(str::to_owned),
+            get(&flags, "pass").map(str::to_owned),
+        )
+    };
+    let (Some(user), Some(pw)) = credentials else {
+        eprintln!("缺少 --user / --pass 或 NEKOSPORTS_USERNAME / NEKOSPORTS_PASSWORD");
         return 1;
     };
+    if user.is_empty() || pw.is_empty() {
+        eprintln!("登录凭据不能为空");
+        return 1;
+    }
     let identity = model::load_identity();
     let mut client = ApiClient::new(identity, None);
     let mut log = logger();
-    match crate::api::login::login(&mut client, user, pw, &mut log) {
+    match crate::api::login::login(&mut client, &user, &pw, &mut log) {
         Ok(s) => {
             if get(&flags, "remember").is_some() {
                 let mut cfg = model::load_config();
@@ -79,9 +99,28 @@ fn cmd_logout() -> i32 {
     let identity = model::load_identity();
     let sess = model::load_session();
     let mut client = ApiClient::new(identity, sess.is_logged_in().then_some(sess));
-    let mut log = logger();
-    crate::api::login::logout(&mut client, &mut log);
-    0
+    let attempted = client.login.is_some();
+    let result = if attempted {
+        client
+            .call("POST", crate::api::login::LOGOUT_PATH, "{}", &[])
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    let cleared = model::clear_session();
+    println!(
+        "{}",
+        serde_json::json!({
+            "server_logout_attempted": attempted,
+            "server_logout_confirmed": attempted && result.is_ok(),
+            "local_session_cleared": cleared,
+        })
+    );
+    if result.is_ok() && cleared {
+        0
+    } else {
+        1
+    }
 }
 
 fn cmd_policy() -> i32 {

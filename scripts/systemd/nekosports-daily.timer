@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the daily Beijing-time plan each minute during the morning window
+
+[Timer]
+OnCalendar=*-*-* 06,07:*:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=nekosports-daily.service
+
+[Install]
+WantedBy=timers.target

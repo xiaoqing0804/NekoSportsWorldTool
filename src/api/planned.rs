@@ -1,5 +1,6 @@
 //! 一次定时跑步的明确参数及提交前约束；不修改请求时钟或账户身高。
 use crate::track::{geom::MET_PER_DEG_LAT, model::Track};
+use rand::{seq::SliceRandom, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -19,12 +20,21 @@ pub struct Plan {
     pub anchor_lon_bd: f64,
     /// 限定本次点位区域；不能替代服务端校园围栏。
     pub max_radius_m: f64,
+    #[serde(default)]
+    pub min_duration_s: i64,
+    #[serde(default)]
+    pub min_ordinary_points: usize,
+    /// 只在当天服务端普通点中抽样，始终保留固定点和策略必经点。
+    #[serde(default)]
+    pub randomize_optional_points: bool,
 }
 
 impl Plan {
     pub fn validate(&self) -> Result<(), String> {
-        if !(1000.0..=2000.0).contains(&self.distance_m)
-            || !(300..=1200).contains(&self.duration_s)
+        if !(1000.0..=3000.0).contains(&self.distance_m)
+            || !(300..=1800).contains(&self.duration_s)
+            || self.min_duration_s < 0
+            || self.duration_s < self.min_duration_s
             || !(100.0..=220.0).contains(&self.height_cm)
             || !(140..=200).contains(&self.cadence_spm)
             || !(50.0..=1500.0).contains(&self.max_radius_m)
@@ -112,7 +122,8 @@ impl Plan {
         if points.is_empty() || super::points::points_bd(points).len() != points.len() {
             return Err("缺少有效服务器打卡点，未提交".into());
         }
-        let route = super::points::route_points(&policy.must_points, points);
+        let selected = self.select_route_points(points)?;
+        let route = super::points::route_points(&policy.must_points, &selected);
         if route
             .iter()
             .any(|&(lat, lon)| self.distance_from_anchor(lat, lon) > self.max_radius_m)
@@ -157,6 +168,35 @@ impl Plan {
         Err(error)
     }
 
+    fn select_route_points(
+        &self,
+        points: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let mut fixed = Vec::new();
+        let mut ordinary = Vec::new();
+        for point in points {
+            if is_fixed(point)? {
+                fixed.push(point.clone());
+            } else {
+                ordinary.push(point.clone());
+            }
+        }
+        if ordinary.len() < self.min_ordinary_points {
+            return Err("服务器普通点数量不足，未提交".into());
+        }
+        if !self.randomize_optional_points {
+            return Ok(points.to_vec());
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed);
+        ordinary.shuffle(&mut rng);
+        let count = rng.gen_range(self.min_ordinary_points..=ordinary.len());
+        fixed.extend(ordinary.into_iter().take(count));
+        if fixed.len() < 3 {
+            return Err("随机选择后不足三个路线点，未提交".into());
+        }
+        Ok(fixed)
+    }
+
     pub fn validate_track(
         &self,
         track: &Track,
@@ -184,22 +224,23 @@ impl Plan {
             return Err("最终轨迹越出本次锚点区域，未提交".into());
         }
         let mut required = policy.must_points.clone();
+        let mut ordinary_passed = 0;
         for point in points {
-            let flag = point.get("isFixed").ok_or("点位缺少固定点标记")?;
-            let fixed = match (flag.as_i64(), flag.as_str(), flag.as_bool()) {
-                (Some(0), _, _) | (_, Some("0"), _) | (_, _, Some(false)) => false,
-                (Some(1), _, _) | (_, Some("1"), _) | (_, _, Some(true)) => true,
-                _ => return Err("无法识别点位的固定点标记".into()),
-            };
-            if fixed {
-                required.push(super::fence::point_xy(point).ok_or("固定点坐标无效")?);
+            let coordinate = super::fence::point_xy(point).ok_or("打卡点坐标无效")?;
+            if is_fixed(point)? {
+                required.push(coordinate);
+            } else if crate::track::wire::passes_point(track, coordinate) {
+                ordinary_passed += 1;
             }
+        }
+        if ordinary_passed < self.min_ordinary_points {
+            return Err("最终轨迹经过的普通点数量不足，未提交".into());
         }
         if required
             .iter()
             .any(|p| !crate::track::wire::passes_point(track, *p))
         {
-            return Err("2 公里内的最终轨迹未经过策略必经点或固定打卡点，未提交".into());
+            return Err("最终轨迹未经过策略必经点或固定打卡点，未提交".into());
         }
         if !fences.is_empty() {
             super::school_roads::validate_fences(fences)?;
@@ -228,6 +269,15 @@ impl Plan {
     }
 }
 
+fn is_fixed(point: &serde_json::Value) -> Result<bool, String> {
+    let flag = point.get("isFixed").ok_or("点位缺少固定点标记")?;
+    match (flag.as_i64(), flag.as_str(), flag.as_bool()) {
+        (Some(0), _, _) | (_, Some("0"), _) | (_, _, Some(false)) => Ok(false),
+        (Some(1), _, _) | (_, Some("1"), _) | (_, _, Some(true)) => Ok(true),
+        _ => Err("无法识别点位的固定点标记".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +295,9 @@ mod tests {
             anchor_lat_bd: 28.54686,
             anchor_lon_bd: 112.39125,
             max_radius_m: 900.0,
+            min_duration_s: 0,
+            min_ordinary_points: 0,
+            randomize_optional_points: false,
         }
     }
     fn policy() -> super::super::policy::PolicyInfo {
@@ -278,6 +331,64 @@ mod tests {
         assert!(p.validate_at(p.scheduled_ms + 300_000).is_err());
         p.start_ms = p.scheduled_ms;
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn daily_distance_duration_and_minimum_time_bounds() {
+        let mut p = plan();
+        p.distance_m = 3000.0;
+        p.duration_s = 1620;
+        p.min_duration_s = 841;
+        p.start_ms = p.scheduled_ms - 60_000 - p.duration_s * 1000;
+        p.validate().unwrap();
+        p.distance_m = 3001.0;
+        assert!(p.validate().is_err());
+        p.distance_m = 2000.0;
+        p.duration_s = 840;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn random_routes_retain_fixed_points_and_enough_live_ordinary_points() {
+        let points: Vec<_> = [
+            (28.54757, 112.39144, 0),
+            (28.541294, 112.390396, 1),
+            (28.545765, 112.394391, 0),
+            (28.547675, 112.396735, 0),
+            (28.542488, 112.398044, 0),
+        ]
+        .into_iter()
+        .map(|(lat, lon, fixed)| {
+            serde_json::json!({
+                "lat":lat, "lon":lon, "isFixed":fixed,
+            })
+        })
+        .collect();
+        let mut p = plan();
+        p.min_ordinary_points = 2;
+        p.randomize_optional_points = true;
+        let mut subsets = std::collections::HashSet::new();
+        for seed in 0..48 {
+            p.seed = seed;
+            p.distance_m = 2000.0 + (seed % 3) as f64 * 500.0;
+            p.duration_s = (p.distance_m * (360.0 + (seed % 4) as f64 * 60.0) / 1000.0) as i64;
+            p.start_ms = p.scheduled_ms - 60_000 - p.duration_s * 1000;
+            let selected = p.select_route_points(&points).unwrap();
+            assert!(selected.contains(&points[1]));
+            assert!(selected.len() >= 3);
+            assert!(selected.iter().all(|point| points.contains(point)));
+            subsets.insert(serde_json::to_string(&selected).unwrap());
+            let track = p.build_track(&policy(), &points, &[]).unwrap();
+            p.validate_track(&track, &policy(), &points, &[]).unwrap();
+        }
+        assert!(subsets.len() > 3);
+        assert!(p.select_route_points(&points[..2]).is_err());
+        let mut track = p.build_track(&policy(), &points, &[]).unwrap();
+        for location in &mut track.locations {
+            location.gLat = points[1]["lat"].as_f64().unwrap();
+            location.gLng = points[1]["lon"].as_f64().unwrap();
+        }
+        assert!(p.validate_track(&track, &policy(), &points, &[]).is_err());
     }
 
     #[test]

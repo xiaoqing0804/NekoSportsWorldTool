@@ -235,8 +235,10 @@ pub fn save_session(s: &Session) -> Result<(), String> {
     write_json("session.json", s)
 }
 
-pub fn clear_session() {
-    let _ = std::fs::remove_file(exe_dir().join("session.json"));
+pub fn clear_session() -> bool {
+    let path = exe_dir().join("session.json");
+    let _ = std::fs::remove_file(&path);
+    !path.exists()
 }
 
 pub fn load_config() -> Config {

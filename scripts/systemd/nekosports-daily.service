@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily campus running test with one submission and logout
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/state/nekosports-daily
+ExecStart=/usr/bin/python3 %h/.local/state/nekosports-daily/daily_runner.py --state-dir %h/.local/state/nekosports-daily
+ExecStopPost=/usr/bin/python3 %h/.local/state/nekosports-daily/daily_runner.py --state-dir %h/.local/state/nekosports-daily --cleanup-today
+Environment=TZ=Asia/Shanghai
+UMask=0077
+TimeoutStartSec=600
+TimeoutStopSec=60
+Restart=no
+StandardOutput=journal
+StandardError=journal

@@ -20,6 +20,7 @@ fn usage() {
 
   login   --user <手机号> --pass <密码> [--remember]
                                            登录并保存会话；--remember 同时保存凭据供自动重登
+  login   --env                            从 NEKOSPORTS_USERNAME / NEKOSPORTS_PASSWORD 环境变量登录
   logout                                   登出并清理本地会话
   policy                                   只读查询跑步策略，输出请求时间与规则响应
   fences                                   只读查询学校跑步围栏与区域编号

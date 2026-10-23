@@ -9,10 +9,54 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 
 CST = dt.timezone(dt.timedelta(hours=8))
+
+
+def credential_environment(path):
+    """Read the two allowed variables without evaluating shell commands."""
+    path = Path(path)
+    if path.stat().st_mode & 0o077:
+        raise ValueError("Environment credentials must be private")
+    values = {}
+    for line in path.read_text().splitlines():
+        parts = shlex.split(line, comments=True)
+        if parts[:1] == ["export"]:
+            parts = parts[1:]
+        if not parts:
+            continue
+        if len(parts) != 1 or "=" not in parts[0]:
+            raise ValueError("Invalid credentials environment format")
+        key, value = parts[0].split("=", 1)
+        if key not in ("NEKOSPORTS_USERNAME", "NEKOSPORTS_PASSWORD") or key in values or not value:
+            raise ValueError("Unexpected or empty credentials variable")
+        values[key] = value
+    if len(values) != 2:
+        raise ValueError("Missing environment credentials")
+    return {**os.environ, **values}
+
+
+def logout_runtime(binary, invoke=subprocess.run):
+    session_path = binary.parent / "session.json"
+    result = {"attempted": False, "server_confirmed": False}
+    try:
+        session = read_json(session_path) if session_path.exists() else {}
+        if session.get("uid", 0) > 0 and session.get("token"):
+            result["attempted"] = True
+            response = invoke([str(binary), "logout"], cwd=binary.parent,
+                              capture_output=True, text=True, timeout=45)
+            result["command_exit"] = response.returncode
+            output = json.loads(response.stdout)
+            result["server_confirmed"] = output.get("server_logout_confirmed") is True
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        result["error_type"] = type(error).__name__
+    finally:
+        session_path.unlink(missing_ok=True)
+        result["local_session_cleared"] = not session_path.exists()
+    return result
 
 
 def read_json(path):
@@ -50,6 +94,8 @@ def preflight(state):
     credential = state / "login-once.json"
     if credential.exists() and credential.stat().st_mode & 0o077:
         raise ValueError("One-use credentials must be private")
+    if manifest.get("credentials_env"):
+        credential_environment(manifest["credentials_env"])
     if "submission_plan_sha256" in manifest:
         plan_path = state / "run-plan.json"
         if hashlib.sha256(plan_path.read_bytes()).hexdigest() != manifest["submission_plan_sha256"]:
@@ -94,7 +140,7 @@ def export_results(state):
         "result.json", "schedule.json", "run-plan.json", "started.json",
         "location.json", "parameter-generation.json", "preview-summary.json",
         "offline-preview.json", "points-before-schedule.json", "policy.log",
-        "policy-before-login.log", "fences.log", "run.log", "run-timeout.log",
+        "policy-before-login.log", "fences.log", "run.log", "run-timeout.log", "cleanup.json",
     )
     files = [(state / name, destination / name) for name in names]
     files.extend((state / "runtime" / name, destination / name) for name in (
@@ -123,7 +169,7 @@ def run_once(state, clock=lambda: dt.datetime.now(CST), invoke=subprocess.run):
         submit_enabled = "submission_plan_sha256" in manifest
         deadline = due + dt.timedelta(minutes=5)
         if not due <= clock() < deadline:
-            print("Outside scheduled 07:00–07:05 window; no request sent.")
+            print("Outside the five-minute scheduled window; no request sent.")
             return 1
         started = clock().isoformat()
         write_json(state / "started.json", {"started_at": started})
@@ -132,24 +178,30 @@ def run_once(state, clock=lambda: dt.datetime.now(CST), invoke=subprocess.run):
                   "record_submitted": False, "location_sent_by_policy": False}
         run_invoked = False
 
-        def call(command, arguments=(), timeout=45):
+        def call(command, arguments=(), timeout=45, environment=None):
             if command not in ("policy", "fences", "login") and not (command == "run-planned" and submit_enabled):
                 raise ValueError("Command is not enabled for this task")
             if not due <= clock() < deadline:
                 raise TimeoutError("Diagnostic window ended")
-            return invoke([str(binary), command, *arguments], capture_output=True,
-                          text=True, timeout=timeout, cwd=binary.parent)
+            kwargs = {"capture_output": True, "text": True, "timeout": timeout, "cwd": binary.parent}
+            if environment is not None:
+                kwargs["env"] = environment
+            return invoke([str(binary), command, *arguments], **kwargs)
 
         try:
             response = call("policy")
             output = response.stdout + response.stderr
             auth_failure = any(marker in output for marker in
                                ("HTTP 401", "未登录", "请先登录", "登录已失效"))
-            if response.returncode and auth_failure and credential_path.exists():
+            if response.returncode and auth_failure and (credential_path.exists() or manifest.get("credentials_env")):
                 (state / "policy-before-login.log").write_text(output)
-                credential = read_json(credential_path)
-                login = call("login", ("--user", credential["username"],
-                                      "--pass", credential["password"]), timeout=150)
+                if manifest.get("credentials_env"):
+                    login = call("login", ("--env",), timeout=150,
+                                 environment=credential_environment(manifest["credentials_env"]))
+                else:
+                    credential = read_json(credential_path)
+                    login = call("login", ("--user", credential["username"],
+                                          "--pass", credential["password"]), timeout=150)
                 # Login logs can contain account data; retain only its outcome.
                 result["login_retry_exit"] = login.returncode
                 if login.returncode:
@@ -209,6 +261,8 @@ def run_once(state, clock=lambda: dt.datetime.now(CST), invoke=subprocess.run):
                     if result.get("record_submitted") is not True:
                         result.update(record_submitted=None, status="submission_unknown_no_retry")
             credential_path.unlink(missing_ok=True)
+            if manifest.get("logout_after_run"):
+                result["logout"] = logout_runtime(binary, invoke)
             result["finished_at"] = clock().isoformat()
             write_json(state / "result.json", result)
             print(json.dumps(result, ensure_ascii=False))
