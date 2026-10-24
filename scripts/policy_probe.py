@@ -140,7 +140,7 @@ def export_results(state):
         "result.json", "schedule.json", "run-plan.json", "started.json",
         "location.json", "parameter-generation.json", "preview-summary.json",
         "offline-preview.json", "points-before-schedule.json", "policy.log",
-        "policy-before-login.log", "fences.log", "run.log", "run-timeout.log", "cleanup.json",
+        "policy-before-login.log", "fences.log", "run.log", "run-timeout.log", "cleanup.json", "weather.json",
     )
     files = [(state / name, destination / name) for name in names]
     files.extend((state / "runtime" / name, destination / name) for name in (

@@ -75,7 +75,9 @@ NekoSportsWorldTool help                                 # 全部命令
 
 计划设置 `randomize_optional_points: true`、`min_ordinary_points: 2`，从当天服务器点位中随机抽取普通点，保留所有固定点及策略必经点，并检查最终轨迹实际经过的数量。身高用于估算参考步频，生成值不是实测数据。规则、点位或围栏校验失败时停止当天提交。
 
-将脚本、固定版本程序和设备身份模板部署到仓库外的私有目录 `~/.local/state/nekosports-daily/`。`settings.json` 必须包含 `first_date`、`binary`、`binary_sha256`、`identity_template`、`credentials_env`、`results_root`、`height_cm`、`anchor_lat_bd`、`anchor_lon_bd`、`max_radius_m`。结果按日期保存；不要把实际配置、身份、凭据或结果提交到 Git。
+将 `daily_runner.py`、`policy_probe.py`、`weather_guard.py`、固定版本程序和设备身份模板部署到仓库外的私有目录 `~/.local/state/nekosports-daily/`。`settings.json` 必须包含 `first_date`、`binary`、`binary_sha256`、`identity_template`、`credentials_env`、`results_root`、`height_cm`、`anchor_lat_bd`、`anchor_lon_bd`、`max_radius_m`，以及 `weather` 对象中的 `latitude_wgs84`、`longitude_wgs84` 和可选的 `name`。天气坐标须转换为 WGS84，不能直接填写跑步使用的 BD-09 坐标。结果按日期保存；不要把实际配置、身份、凭据或结果提交到 Git。
+
+每天到提交窗口后、登录校园跑之前，查询 [Open-Meteo 当前天气](https://open-meteo.com/en/docs)。该数据采用约15分钟粒度的天气模型；检测到降水量大于0或毛毛雨、雨、阵雨、雷暴天气代码时，记录 `skipped_rain`，当天不再登录、提交或重试。接口失败、数据缺失、时间超过30分钟或位置不符时记录 `skipped_weather_unavailable`，也跳过当天。次日重新查询。天气响应及判断保存在 `weather.json` 和 `result.json`，并导出到当天结果目录；查询只发送天气位置，不发送校园跑账号或凭据。
 
 凭据文件仅允许 `NEKOSPORTS_USERNAME` 和 `NEKOSPORTS_PASSWORD` 两个赋值，支持可选的 `export` 前缀，权限必须为 `0600`；解析时不会执行 shell。调度器使用 `login --env`，密码不会出现在命令行参数或登录日志文件里。每次执行结束（包括失败）调用服务端登出并清除本地会话；`result.json` 的 `logout.server_confirmed` 单独记录服务器是否确认。异常终止后的清理由 `ExecStopPost` 执行，长期凭据文件保留供下一天登录。
 

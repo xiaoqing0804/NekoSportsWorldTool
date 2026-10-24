@@ -14,6 +14,7 @@ import secrets
 import shutil
 
 import policy_probe as probe
+from weather_guard import check_weather
 
 
 def generate_plan(day, settings, seed=None):
@@ -118,9 +119,28 @@ def tick(root, clock=lambda: dt.datetime.now(probe.CST)):
         })
         probe.export_results(state)
         return 0
+    weather = check_weather(settings, now=now)
+    probe.write_json(state / "weather.json", weather)
+    if weather["decision"] != "dry":
+        status = "skipped_rain" if weather["decision"] == "rain" else "skipped_weather_unavailable"
+        # Make the skip terminal for this date before returning to the repeating timer.
+        probe.write_json(state / "started.json", {"skipped_at": now.isoformat(), "reason": status})
+        result = {
+            "status": status, "record_submitted": False, "login_attempted": False,
+            "scheduled_at": due.isoformat(), "finished_at": clock().isoformat(), "weather": weather,
+        }
+        probe.write_json(state / "result.json", result)
+        probe.export_results(state)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     try:
         return probe.run_once(state, clock=clock)
     finally:
+        result_path = state / "result.json"
+        if result_path.exists():
+            result = probe.read_json(result_path)
+            result["weather"] = weather
+            probe.write_json(result_path, result)
         probe.export_results(state)
 
 

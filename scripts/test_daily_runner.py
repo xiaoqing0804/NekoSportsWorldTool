@@ -31,6 +31,7 @@ class DailyRunnerTests(unittest.TestCase):
             "results_root": str(self.root / "results"), "height_cm": 156,
             "anchor_lat_bd": 28.546861820699, "anchor_lon_bd": 112.391247914315,
             "max_radius_m": 900,
+            "weather": {"latitude_wgs84": 28.5445, "longitude_wgs84": 112.3793},
         }
         probe.write_json(self.root / "settings.json", self.settings)
         self.day = dt.date(2026, 10, 24)
@@ -84,6 +85,64 @@ class DailyRunnerTests(unittest.TestCase):
 
     def test_success_login_by_environment_logout_and_no_repeat(self):
         self.run_with_login(fail_run=False)
+
+    def test_rain_skip_is_final_for_the_day_without_login_or_submission(self):
+        state, due = self.prepared()
+        report = {"decision": "rain", "reason": "precipitation_detected"}
+        with patch.object(daily, "check_weather", return_value=report) as check, \
+                patch.object(probe, "run_once") as run:
+            daily.tick(self.root, clock=lambda: due)
+            daily.tick(self.root, clock=lambda: due + dt.timedelta(minutes=1))
+            check.assert_called_once()
+            run.assert_not_called()
+        result = probe.read_json(state / "result.json")
+        self.assertEqual(result["status"], "skipped_rain")
+        self.assertFalse(result["record_submitted"])
+        self.assertFalse(result["login_attempted"])
+        self.assertEqual(probe.read_json(state / "weather.json"), report)
+        destination = Path(self.settings["results_root"]) / self.day.isoformat()
+        self.assertEqual(probe.read_json(destination / "weather.json"), report)
+
+    def test_weather_failure_skips_instead_of_assuming_dry(self):
+        state, due = self.prepared()
+        with patch.object(daily, "check_weather", return_value={"decision": "unavailable"}), \
+                patch.object(probe, "run_once") as run:
+            daily.tick(self.root, clock=lambda: due)
+            run.assert_not_called()
+        self.assertEqual(probe.read_json(state / "result.json")["status"], "skipped_weather_unavailable")
+
+    def test_next_day_rechecks_weather_and_dry_result_is_saved_with_submission(self):
+        state, due = self.prepared()
+        next_state = daily.prepare(self.root, self.day + dt.timedelta(days=1))
+        next_due = dt.datetime.fromisoformat(probe.read_json(next_state / "schedule.json")["scheduled_at"])
+        events = []
+
+        def weather(settings, now):
+            events.append("weather")
+            return {"decision": "rain" if now == due else "dry"}
+
+        def run(state, clock):
+            events.append("run")
+            probe.write_json(state / "started.json", {})
+            probe.write_json(state / "result.json", {"record_submitted": True})
+            return 0
+
+        with patch.object(daily, "check_weather", side_effect=weather), \
+                patch.object(probe, "run_once", side_effect=run):
+            daily.tick(self.root, clock=lambda: due)
+            daily.tick(self.root, clock=lambda: next_due)
+            daily.tick(self.root, clock=lambda: next_due)
+        self.assertEqual(events, ["weather", "weather", "run"])
+        self.assertEqual(probe.read_json(state / "result.json")["status"], "skipped_rain")
+        self.assertEqual(probe.read_json(next_state / "result.json")["weather"]["decision"], "dry")
+
+    def test_weather_is_not_queried_before_due_or_after_completion(self):
+        state, due = self.prepared()
+        with patch.object(daily, "check_weather") as weather:
+            daily.tick(self.root, clock=lambda: due - dt.timedelta(seconds=1))
+            probe.write_json(state / "started.json", {})
+            daily.tick(self.root, clock=lambda: due)
+            weather.assert_not_called()
 
     def test_failure_also_logs_out_and_server_logout_failure_is_not_hidden(self):
         self.run_with_login(fail_run=True)
